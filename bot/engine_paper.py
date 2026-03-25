@@ -1,5 +1,5 @@
 """
-Paper trading engine — uses real market data with virtual balance.
+Paper trading engine — multi-symbol, real market data, virtual balance.
 No MetaTrader 5 required.
 
 Data sources (auto-selected):
@@ -13,6 +13,7 @@ import time
 import signal as sig
 import sys
 from datetime import datetime
+from dataclasses import dataclass, field
 
 # Try yfinance first, fall back to built-in simulator
 _DATA_SOURCE = "Built-in simulator"
@@ -42,6 +43,25 @@ from bot.data_provider_sim import (
     get_current_price as sim_get_current_price,
 )
 
+from bot.zones import detect_zones, Zone, ZoneType
+from bot.entry import find_entry, TradeSetup, Signal
+from bot.risk_manager import calculate_lot_size
+from bot.paper_trader import PaperTrader, PaperPosition
+from config.settings import (
+    HTF_TIMEFRAME, LTF_TIMEFRAME, HTF_BARS, LTF_BARS,
+    RISK_PER_TRADE_PCT, BREAKEVEN_TRIGGER_RR,
+    TRAILING_STOP_ENABLED, TRAILING_STEP_POINTS, SL_BUFFER_POINTS,
+)
+
+
+# All supported forex pairs
+ALL_SYMBOLS = [
+    "EURUSD", "GBPUSD", "USDJPY", "USDCHF",
+    "AUDUSD", "NZDUSD", "USDCAD",
+    "EURGBP", "EURJPY", "GBPJPY",
+    "XAUUSD",
+]
+
 
 def _safe_get_rates(symbol, timeframe, count):
     if _DATA_SOURCE.startswith("Yahoo"):
@@ -68,62 +88,76 @@ def _safe_get_point_size(symbol):
         except Exception:
             pass
     return sim_get_point_size(symbol)
-from bot.zones import detect_zones, Zone, ZoneType
-from bot.entry import find_entry, TradeSetup, Signal
-from bot.risk_manager import calculate_lot_size
-from bot.paper_trader import PaperTrader, PaperPosition
-from config.settings import (
-    HTF_TIMEFRAME, LTF_TIMEFRAME, HTF_BARS, LTF_BARS,
-    RISK_PER_TRADE_PCT, BREAKEVEN_TRIGGER_RR,
-    TRAILING_STOP_ENABLED, TRAILING_STEP_POINTS, SL_BUFFER_POINTS,
-)
+
+
+@dataclass
+class SymbolState:
+    """Tracked state per symbol."""
+    symbol: str
+    point_size: float
+    zones: list[Zone] = field(default_factory=list)
+    last_htf_bar_time: object = None
 
 
 class PaperTradingEngine:
     """
-    Real data + virtual money.
+    Multi-symbol paper trading engine.
 
-    Workflow:
-    1. Fetch real OHLCV from Yahoo Finance.
-    2. Detect zones on HTF, find entries on LTF.
-    3. Execute virtual trades, manage SL/TP/trailing.
-    4. Print live P&L and summary on exit.
+    Workflow per tick:
+    1. Refresh zones for all symbols.
+    2. Fetch prices, update open positions.
+    3. For symbols without open positions, scan for entries.
     """
 
     def __init__(
         self,
-        symbol: str = "EURUSD",
+        symbols: list[str] | None = None,
         balance: float = 200.0,
         risk_pct: float = 3.0,
         poll_interval: int = 30,
+        max_positions: int = 3,
     ):
-        self.symbol = symbol
+        if symbols is None:
+            symbols = ALL_SYMBOLS
+
+        self.symbols = symbols
         self.risk_pct = risk_pct
         self.poll_interval = poll_interval
-        self.point_size = _safe_get_point_size(symbol)
+        self.max_positions = max_positions
         self.trader = PaperTrader(balance=balance)
-        self.zones: list[Zone] = []
-        self.last_htf_bar_time = None
         self._running = True
 
+        # Per-symbol state
+        self.states: dict[str, SymbolState] = {}
+        for sym in symbols:
+            self.states[sym] = SymbolState(
+                symbol=sym,
+                point_size=_safe_get_point_size(sym),
+            )
+
     def start(self):
-        # Handle Ctrl+C gracefully
         sig.signal(sig.SIGINT, self._handle_exit)
         sig.signal(sig.SIGTERM, self._handle_exit)
 
-        print("=" * 60)
-        print("  MarketShift — Paper Trading Mode")
-        print(f"  Data:      {_DATA_SOURCE}")
-        print(f"  Symbol:    {self.symbol}")
-        print(f"  Balance:   ${self.trader.account.balance:.2f}")
-        print(f"  Risk/trade:{self.risk_pct}%")
-        print(f"  HTF:       {HTF_TIMEFRAME}  |  LTF: {LTF_TIMEFRAME}")
-        print(f"  Poll:      every {self.poll_interval}s")
-        print("=" * 60)
+        sym_list = ", ".join(self.symbols)
+        print("=" * 65)
+        print("  MarketShift — Multi-Symbol Paper Trading")
+        print(f"  Data:       {_DATA_SOURCE}")
+        print(f"  Symbols:    {sym_list}")
+        print(f"  Balance:    ${self.trader.account.balance:.2f}")
+        print(f"  Risk/trade: {self.risk_pct}%")
+        print(f"  Max open:   {self.max_positions} positions")
+        print(f"  HTF: {HTF_TIMEFRAME}  |  LTF: {LTF_TIMEFRAME}")
+        print(f"  Poll:       every {self.poll_interval}s")
+        print("=" * 65)
 
         print("\n[ENGINE] Loading initial data...")
-        self._refresh_zones()
-        print(f"[ENGINE] Found {len(self.zones)} active zones. Starting loop.\n")
+        total_zones = 0
+        for sym in self.symbols:
+            self._refresh_zones(sym)
+            total_zones += len(self.states[sym].zones)
+        print(f"[ENGINE] {total_zones} total zones across "
+              f"{len(self.symbols)} symbols. Starting loop.\n")
         print("Press Ctrl+C to stop and see summary.\n")
 
         while self._running:
@@ -141,113 +175,154 @@ class PaperTradingEngine:
         print("\n[ENGINE] Shutting down...")
         self._running = False
 
-    def _refresh_zones(self):
-        """Fetch HTF data and detect zones."""
+    # ── Zone refresh ─────────────────────────────────────────────────
+
+    def _refresh_zones(self, symbol: str):
+        state = self.states[symbol]
         try:
-            df_htf = _safe_get_rates(self.symbol, HTF_TIMEFRAME, HTF_BARS)
+            df_htf = _safe_get_rates(symbol, HTF_TIMEFRAME, HTF_BARS)
         except Exception as e:
-            print(f"[ENGINE] Failed to fetch HTF data: {e}")
+            print(f"[{symbol}] HTF data error: {e}")
             return
 
         current_htf_time = df_htf["time"].iloc[-1]
+        if state.last_htf_bar_time is not None and current_htf_time == state.last_htf_bar_time:
+            return
 
-        if self.last_htf_bar_time is None or current_htf_time != self.last_htf_bar_time:
-            self.zones = detect_zones(df_htf)
-            self.last_htf_bar_time = current_htf_time
-            print(f"[ZONES] {current_htf_time} — {len(self.zones)} zones detected:")
-            for z in self.zones[:8]:
+        state.zones = detect_zones(df_htf)
+        state.last_htf_bar_time = current_htf_time
+
+        if state.zones:
+            print(f"[ZONES] {symbol} — {len(state.zones)} zones:")
+            for z in state.zones[:3]:
                 rn = " [ROUND]" if z.round_number else ""
                 print(f"  {z.zone_type.value:6s} | "
                       f"{z.lower:.5f} – {z.upper:.5f} | "
-                      f"touches={z.touches} impulse={z.impulse_score:.2f} "
-                      f"score={z.score:.2f}{rn}")
+                      f"touches={z.touches} score={z.score:.2f}{rn}")
+
+    # ── Main tick ────────────────────────────────────────────────────
 
     def _tick(self):
-        """Single iteration of the trading loop."""
-        # 1. Refresh zones
-        self._refresh_zones()
-
-        # 2. Get current price
-        try:
-            bid, ask = _safe_get_current_price(self.symbol)
-        except Exception as e:
-            print(f"[ENGINE] Price fetch error: {e}")
-            return
-
-        current_price = (bid + ask) / 2
         now = datetime.now().strftime("%H:%M:%S")
 
-        # 3. Update open positions (SL/TP check + trailing)
-        if self.trader.has_open_positions:
-            self._manage_positions(bid, ask)
-            self.trader.update_positions(bid, ask, self.point_size)
+        # 1. Refresh zones for all symbols
+        for sym in self.symbols:
+            self._refresh_zones(sym)
 
-            # Status line
-            pos = self.trader.account.positions
-            if pos:
-                p = pos[0]
-                if p.signal == Signal.LONG:
-                    unrealized = (bid - p.entry_price) / self.point_size
-                else:
-                    unrealized = (p.entry_price - ask) / self.point_size
-                print(f"[{now}] {self.symbol} bid={bid:.5f} | "
-                      f"Position #{p.ticket} {p.signal.value} "
-                      f"pips={unrealized:.1f} SL={p.stop_loss:.5f}")
+        # 2. Get all prices
+        price_feeds: dict[str, tuple[float, float]] = {}
+        for sym in self.symbols:
+            try:
+                bid, ask = _safe_get_current_price(sym)
+                price_feeds[sym] = (bid, ask)
+            except Exception:
+                pass
+
+        # 3. Manage open positions
+        if self.trader.has_open_positions:
+            self._manage_all_positions(price_feeds)
+        self.trader.update_all_positions(price_feeds)
+
+        # 4. Status line for open positions
+        open_count = len(self.trader.account.positions)
+        if open_count > 0:
+            parts = []
+            for pos in self.trader.account.positions:
+                if pos.symbol in price_feeds:
+                    bid, ask = price_feeds[pos.symbol]
+                    if pos.signal == Signal.LONG:
+                        pips = (bid - pos.entry_price) / pos.point_size
+                    else:
+                        pips = (pos.entry_price - ask) / pos.point_size
+                    parts.append(f"#{pos.ticket} {pos.symbol} {pos.signal.value} "
+                                 f"{pips:+.1f}p")
+            print(f"[{now}] Open: {' | '.join(parts)} | "
+                  f"Equity: ${self.trader.account.equity:.2f}")
+
+        # 5. Search for new entries (if we have room)
+        if open_count >= self.max_positions:
+            if open_count > 0:
+                return
             return
 
-        # 4. No open position — search for entry
-        print(f"[{now}] {self.symbol} bid={bid:.5f} ask={ask:.5f} | Scanning...")
+        # Which symbols already have open positions?
+        symbols_with_positions = {
+            pos.symbol for pos in self.trader.account.positions
+        }
 
-        for zone in self.zones:
-            if not (zone.lower <= current_price <= zone.upper):
+        scanned = []
+        for sym in self.symbols:
+            if sym in symbols_with_positions:
+                continue
+            if len(self.trader.account.positions) >= self.max_positions:
+                break
+
+            state = self.states[sym]
+            if not state.zones:
+                continue
+            if sym not in price_feeds:
                 continue
 
-            print(f"  Price in {zone.zone_type.value} zone "
-                  f"[{zone.lower:.5f}–{zone.upper:.5f}]")
+            bid, ask = price_feeds[sym]
+            current_price = (bid + ask) / 2
 
-            # Find TP target
-            tp_target = self._find_tp_target(zone)
-            if tp_target is None:
-                print(f"  No opposing zone for TP — skip")
-                continue
+            found_entry = False
+            for zone in state.zones:
+                if not (zone.lower <= current_price <= zone.upper):
+                    continue
 
-            # Get LTF data and look for entry
-            try:
-                df_ltf = _safe_get_rates(self.symbol, LTF_TIMEFRAME, LTF_BARS)
-            except Exception as e:
-                print(f"  LTF data error: {e}")
-                continue
+                tp_target = self._find_tp_target(state, zone)
+                if tp_target is None:
+                    continue
 
-            setup = find_entry(df_ltf, zone, tp_target, self.point_size)
-            if setup is None:
-                print(f"  No BOS entry signal yet")
-                continue
+                try:
+                    df_ltf = _safe_get_rates(sym, LTF_TIMEFRAME, LTF_BARS)
+                except Exception:
+                    continue
 
-            # Execute paper trade
-            sl_distance = abs(setup.entry_price - setup.stop_loss)
-            lot = calculate_lot_size(
-                account_balance=self.trader.account.balance,
-                risk_pct=self.risk_pct,
-                sl_distance=sl_distance,
-                point_value=10.0,  # ~$10/pip per standard lot
-                point_size=self.point_size,
-            )
+                setup = find_entry(df_ltf, zone, tp_target, state.point_size)
+                if setup is None:
+                    continue
 
-            entry_price = ask if setup.signal == Signal.LONG else bid
+                # Execute paper trade
+                sl_distance = abs(setup.entry_price - setup.stop_loss)
+                lot = calculate_lot_size(
+                    account_balance=self.trader.account.balance,
+                    risk_pct=self.risk_pct,
+                    sl_distance=sl_distance,
+                    point_value=10.0,
+                    point_size=state.point_size,
+                )
 
-            self.trader.open_position(
-                signal=setup.signal,
-                entry_price=entry_price,
-                stop_loss=setup.stop_loss,
-                take_profit=setup.take_profit,
-                lot_size=lot,
-            )
-            print(f"  R:R = {setup.rr_ratio} | Lot = {lot}")
-            break
+                entry_price = ask if setup.signal == Signal.LONG else bid
 
-    def _manage_positions(self, bid: float, ask: float):
-        """Breakeven + trailing stop logic."""
+                self.trader.open_position(
+                    symbol=sym,
+                    signal=setup.signal,
+                    entry_price=entry_price,
+                    stop_loss=setup.stop_loss,
+                    take_profit=setup.take_profit,
+                    lot_size=lot,
+                    point_size=state.point_size,
+                )
+                print(f"  R:R = {setup.rr_ratio} | Lot = {lot}")
+                found_entry = True
+                break
+
+            if not found_entry:
+                scanned.append(sym)
+
+        if scanned and open_count == 0:
+            print(f"[{now}] Scanned {len(scanned)} symbols — no entries | "
+                  f"Balance: ${self.trader.account.balance:.2f}")
+
+    # ── Position management ──────────────────────────────────────────
+
+    def _manage_all_positions(self, price_feeds: dict[str, tuple[float, float]]):
         for pos in self.trader.account.positions:
+            if pos.symbol not in price_feeds:
+                continue
+            bid, ask = price_feeds[pos.symbol]
             current_price = bid if pos.signal == Signal.SHORT else ask
 
             # Breakeven
@@ -264,7 +339,7 @@ class PaperTradingEngine:
 
             # Trailing stop
             if TRAILING_STOP_ENABLED and pos.breakeven_applied:
-                step = TRAILING_STEP_POINTS * self.point_size
+                step = TRAILING_STEP_POINTS * pos.point_size
                 if pos.signal == Signal.LONG:
                     candidate = current_price - step
                     if candidate > pos.stop_loss:
@@ -274,13 +349,14 @@ class PaperTradingEngine:
                     if candidate < pos.stop_loss:
                         self.trader.modify_sl(pos, round(candidate, 5))
 
-    def _find_tp_target(self, active_zone: Zone) -> float | None:
-        """Find nearest opposing zone as TP."""
+    # ── TP target ────────────────────────────────────────────────────
+
+    def _find_tp_target(self, state: SymbolState, active_zone: Zone) -> float | None:
         opposing = (
             ZoneType.DEMAND if active_zone.zone_type == ZoneType.SUPPLY
             else ZoneType.SUPPLY
         )
-        candidates = [z for z in self.zones if z.zone_type == opposing]
+        candidates = [z for z in state.zones if z.zone_type == opposing]
 
         if not candidates:
             return None
