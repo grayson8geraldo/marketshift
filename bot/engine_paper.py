@@ -296,7 +296,7 @@ class PaperTradingEngine:
 
                 entry_price = ask if setup.signal == Signal.LONG else bid
 
-                self.trader.open_position(
+                pos = self.trader.open_position(
                     symbol=sym,
                     signal=setup.signal,
                     entry_price=entry_price,
@@ -305,7 +305,10 @@ class PaperTradingEngine:
                     lot_size=lot,
                     point_size=state.point_size,
                 )
-                print(f"  R:R = {setup.rr_ratio} | Lot = {lot}")
+                # Pass structure data for trailing/breakeven
+                pos.first_structure_level = setup.first_structure_level
+                print(f"  R:R = {setup.rr_ratio} | Lot = {lot} | "
+                      f"Exhaustion={'YES' if setup.exhaustion else 'NO'}")
                 found_entry = True
                 break
 
@@ -319,35 +322,80 @@ class PaperTradingEngine:
     # ── Position management ──────────────────────────────────────────
 
     def _manage_all_positions(self, price_feeds: dict[str, tuple[float, float]]):
+        """
+        Per-strategy position management:
+        1. Breakeven: when price breaks the first local support/resistance level
+        2. Trailing: move SL behind new swing extremes as trend develops
+        """
         for pos in self.trader.account.positions:
             if pos.symbol not in price_feeds:
                 continue
             bid, ask = price_feeds[pos.symbol]
             current_price = bid if pos.signal == Signal.SHORT else ask
 
-            # Breakeven
-            if not pos.breakeven_applied:
+            # ── 1. Breakeven on first structure level break ──────────
+            if not pos.breakeven_applied and pos.first_structure_level is not None:
+                if pos.signal == Signal.LONG and current_price > pos.first_structure_level:
+                    self.trader.modify_sl(pos, pos.entry_price)
+                    pos.breakeven_applied = True
+                    print(f"  [STRAT] #{pos.ticket} {pos.symbol}: price broke "
+                          f"resistance {pos.first_structure_level:.5f} → BE")
+                elif pos.signal == Signal.SHORT and current_price < pos.first_structure_level:
+                    self.trader.modify_sl(pos, pos.entry_price)
+                    pos.breakeven_applied = True
+                    print(f"  [STRAT] #{pos.ticket} {pos.symbol}: price broke "
+                          f"support {pos.first_structure_level:.5f} → BE")
+
+            # Fallback: if no structure level, use 1R as breakeven trigger
+            if not pos.breakeven_applied and pos.first_structure_level is None:
                 risk = abs(pos.entry_price - pos.stop_loss)
                 if pos.signal == Signal.LONG:
                     profit = current_price - pos.entry_price
                 else:
                     profit = pos.entry_price - current_price
-
                 if risk > 0 and (profit / risk) >= BREAKEVEN_TRIGGER_RR:
                     self.trader.modify_sl(pos, pos.entry_price)
                     pos.breakeven_applied = True
 
-            # Trailing stop
+            # ── 2. Trailing stop behind swing extremes ───────────────
             if TRAILING_STOP_ENABLED and pos.breakeven_applied:
-                step = TRAILING_STEP_POINTS * pos.point_size
-                if pos.signal == Signal.LONG:
-                    candidate = current_price - step
-                    if candidate > pos.stop_loss:
-                        self.trader.modify_sl(pos, round(candidate, 5))
-                else:
-                    candidate = current_price + step
-                    if candidate < pos.stop_loss:
-                        self.trader.modify_sl(pos, round(candidate, 5))
+                # Refresh LTF swings for this symbol to get new structure
+                try:
+                    df_ltf = _safe_get_rates(pos.symbol, LTF_TIMEFRAME, LTF_BARS)
+                    from bot.entry import _ltf_swings
+                    sh_idx, sh_price, sl_idx, sl_price = _ltf_swings(df_ltf)
+
+                    if pos.signal == Signal.LONG:
+                        # Trail behind the most recent swing low
+                        recent_lows = [
+                            p for idx, p in zip(sl_idx, sl_price)
+                            if p > pos.stop_loss and p < current_price
+                        ]
+                        if recent_lows:
+                            new_sl = max(recent_lows) - (SL_BUFFER_POINTS * pos.point_size)
+                            if new_sl > pos.stop_loss:
+                                self.trader.modify_sl(pos, round(new_sl, 5))
+                    else:
+                        # Trail behind the most recent swing high
+                        recent_highs = [
+                            p for idx, p in zip(sh_idx, sh_price)
+                            if p < pos.stop_loss and p > current_price
+                        ]
+                        if recent_highs:
+                            new_sl = min(recent_highs) + (SL_BUFFER_POINTS * pos.point_size)
+                            if new_sl < pos.stop_loss:
+                                self.trader.modify_sl(pos, round(new_sl, 5))
+                except Exception:
+                    # Fallback to fixed step if data unavailable
+                    step = TRAILING_STEP_POINTS * pos.point_size
+                    if pos.signal == Signal.LONG:
+                        candidate = current_price - step
+                        if candidate > pos.stop_loss:
+                            self.trader.modify_sl(pos, round(candidate, 5))
+                    else:
+                        candidate = current_price + step
+                        if candidate < pos.stop_loss:
+                            self.trader.modify_sl(pos, round(candidate, 5))
 
     # ── TP target ────────────────────────────────────────────────────
 

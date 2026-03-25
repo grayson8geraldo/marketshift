@@ -36,7 +36,10 @@ class PaperPosition:
     state: PositionState = PositionState.OPEN
     pnl: float = 0.0
     breakeven_applied: bool = False
-    max_favorable: float = 0.0   # max favorable excursion in $
+    max_favorable: float = 0.0
+    # Structure-based management data
+    first_structure_level: float | None = None  # breakeven trigger level
+    trailing_swing_prices: list = None  # swing extremes for trailing stop
 
 
 @dataclass

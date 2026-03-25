@@ -42,6 +42,14 @@ class TradeSetup:
     zone: Zone
     rr_ratio: float
     bar_index: int          # LTF bar index of the entry trigger
+    exhaustion: bool = False # Was there an exhaustion move into the zone?
+    # Swing structure for trailing stop (indices into LTF data)
+    structure_swing_high_idx: list = None  # swing high indices after BOS
+    structure_swing_low_idx: list = None   # swing low indices after BOS
+    structure_swing_high_price: list = None
+    structure_swing_low_price: list = None
+    # First opposing structure level for breakeven trigger
+    first_structure_level: float | None = None
 
 
 # ── LTF swing detection (fractals) ──────────────────────────────────────
@@ -225,6 +233,7 @@ def find_entry(df_ltf: pd.DataFrame, zone: Zone,
 
     Returns a TradeSetup or None if no valid entry found.
     """
+    opens = df_ltf["open"].values
     highs = df_ltf["high"].values
     lows = df_ltf["low"].values
     closes = df_ltf["close"].values
@@ -242,34 +251,43 @@ def find_entry(df_ltf: pd.DataFrame, zone: Zone,
     if arrival_idx is None:
         return None
 
-    # 2. Check exhaustion (optional but improves win rate)
+    # 2. Exhaustion detection — REQUIRED by strategy
+    #    Price must approach the zone with big candles and minimal retracements.
     is_exhaustion = _detect_exhaustion(df_ltf, zone, arrival_idx)
+    if not is_exhaustion:
+        return None
 
     # 3. Compute LTF swings
     sh_idx, sh_price, sl_idx, sl_price = _ltf_swings(df_ltf)
 
-    # 4. Detect structure break
+    # 4. Detect structure break (BOS)
     bos_idx = _detect_structure_break(
         df_ltf, zone, sh_idx, sh_price, sl_idx, sl_price, arrival_idx
     )
     if bos_idx is None:
         return None
 
-    # 5. Build trade setup
+    # 5. Validate BOS candle is a "big candle" (strong momentum confirmation)
+    bos_body = abs(closes[bos_idx] - opens[bos_idx])
+    bos_range = highs[bos_idx] - lows[bos_idx]
+    if bos_range > 0 and bos_body / bos_range < 0.5:
+        return None  # Weak BOS candle (doji/spinning top) — skip
+
+    # 6. Build trade setup
     entry_price = closes[bos_idx]
     buffer = SL_BUFFER_POINTS * point_size
     min_sl_distance = MIN_SL_PIPS * point_size * 10  # pips -> price distance
 
     if zone.zone_type == ZoneType.SUPPLY:
-        # SHORT — SL above the zone upper boundary (the wick extreme)
-        # Use whichever is higher: zone upper or highest LTF swing high
+        # SHORT — SL above the formed swing high in the reversal structure
+        # This is the highest point of the micro HH/HL pattern that just broke
         recent_sh_in_zone = [
             p for idx, p in zip(sh_idx, sh_price)
             if arrival_idx <= idx <= bos_idx
         ]
+        # SL at the reversal high (highest swing formed inside the zone)
         swing_sl = max(recent_sh_in_zone) if recent_sh_in_zone else zone.upper
-        # SL must be at least at the zone upper boundary
-        sl_price_val = max(swing_sl, zone.upper) + buffer
+        sl_price_val = swing_sl + buffer
 
         signal = Signal.SHORT
 
@@ -277,21 +295,29 @@ def find_entry(df_ltf: pd.DataFrame, zone: Zone,
         if sl_price_val - entry_price < min_sl_distance:
             sl_price_val = entry_price + min_sl_distance
 
-        # Validate: SL must be above entry for short
+        # Validate direction
         if sl_price_val <= entry_price:
             return None
 
         risk = sl_price_val - entry_price
         reward = entry_price - tp_target
+
+        # First local support level for breakeven trigger
+        # (first swing low below entry after BOS)
+        first_level = None
+        for idx, p in zip(sl_idx, sl_price):
+            if idx > bos_idx and p < entry_price:
+                first_level = p
+                break
+
     else:
-        # LONG — SL below the zone lower boundary (the wick extreme)
+        # LONG — SL below the formed swing low in the reversal structure
         recent_sl_in_zone = [
             p for idx, p in zip(sl_idx, sl_price)
             if arrival_idx <= idx <= bos_idx
         ]
         swing_sl = min(recent_sl_in_zone) if recent_sl_in_zone else zone.lower
-        # SL must be at least at the zone lower boundary
-        sl_price_val = min(swing_sl, zone.lower) - buffer
+        sl_price_val = swing_sl - buffer
 
         signal = Signal.LONG
 
@@ -299,12 +325,19 @@ def find_entry(df_ltf: pd.DataFrame, zone: Zone,
         if entry_price - sl_price_val < min_sl_distance:
             sl_price_val = entry_price - min_sl_distance
 
-        # Validate: SL must be below entry for long
+        # Validate direction
         if sl_price_val >= entry_price:
             return None
 
         risk = entry_price - sl_price_val
         reward = tp_target - entry_price
+
+        # First local resistance level for breakeven trigger
+        first_level = None
+        for idx, p in zip(sh_idx, sh_price):
+            if idx > bos_idx and p > entry_price:
+                first_level = p
+                break
 
     if risk <= 0 or reward <= 0:
         return None
@@ -313,7 +346,7 @@ def find_entry(df_ltf: pd.DataFrame, zone: Zone,
     if rr < MIN_RR_RATIO:
         return None
     if rr > MAX_RR_RATIO:
-        return None  # Unrealistic R:R = bad SL placement
+        return None
 
     return TradeSetup(
         signal=signal,
@@ -323,4 +356,10 @@ def find_entry(df_ltf: pd.DataFrame, zone: Zone,
         zone=zone,
         rr_ratio=round(rr, 2),
         bar_index=bos_idx,
+        exhaustion=is_exhaustion,
+        structure_swing_high_idx=sh_idx,
+        structure_swing_low_idx=sl_idx,
+        structure_swing_high_price=sh_price,
+        structure_swing_low_price=sl_price,
+        first_structure_level=first_level,
     )
