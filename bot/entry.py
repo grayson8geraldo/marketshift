@@ -23,6 +23,8 @@ from config.settings import (
     STRUCTURE_BREAK_CONFIRM,
     SL_BUFFER_POINTS,
     MIN_RR_RATIO,
+    MAX_RR_RATIO,
+    MIN_SL_PIPS,
 )
 
 
@@ -256,37 +258,62 @@ def find_entry(df_ltf: pd.DataFrame, zone: Zone,
     # 5. Build trade setup
     entry_price = closes[bos_idx]
     buffer = SL_BUFFER_POINTS * point_size
+    min_sl_distance = MIN_SL_PIPS * point_size * 10  # pips -> price distance
 
     if zone.zone_type == ZoneType.SUPPLY:
-        # SHORT
-        # SL above the highest recent swing high inside the zone
+        # SHORT — SL above the zone upper boundary (the wick extreme)
+        # Use whichever is higher: zone upper or highest LTF swing high
         recent_sh_in_zone = [
             p for idx, p in zip(sh_idx, sh_price)
             if arrival_idx <= idx <= bos_idx
         ]
-        sl_price_val = (max(recent_sh_in_zone) if recent_sh_in_zone
-                        else zone.upper) + buffer
+        swing_sl = max(recent_sh_in_zone) if recent_sh_in_zone else zone.upper
+        # SL must be at least at the zone upper boundary
+        sl_price_val = max(swing_sl, zone.upper) + buffer
+
         signal = Signal.SHORT
+
+        # Enforce minimum SL distance
+        if sl_price_val - entry_price < min_sl_distance:
+            sl_price_val = entry_price + min_sl_distance
+
+        # Validate: SL must be above entry for short
+        if sl_price_val <= entry_price:
+            return None
+
         risk = sl_price_val - entry_price
         reward = entry_price - tp_target
     else:
-        # LONG
+        # LONG — SL below the zone lower boundary (the wick extreme)
         recent_sl_in_zone = [
             p for idx, p in zip(sl_idx, sl_price)
             if arrival_idx <= idx <= bos_idx
         ]
-        sl_price_val = (min(recent_sl_in_zone) if recent_sl_in_zone
-                        else zone.lower) - buffer
+        swing_sl = min(recent_sl_in_zone) if recent_sl_in_zone else zone.lower
+        # SL must be at least at the zone lower boundary
+        sl_price_val = min(swing_sl, zone.lower) - buffer
+
         signal = Signal.LONG
+
+        # Enforce minimum SL distance
+        if entry_price - sl_price_val < min_sl_distance:
+            sl_price_val = entry_price - min_sl_distance
+
+        # Validate: SL must be below entry for long
+        if sl_price_val >= entry_price:
+            return None
+
         risk = entry_price - sl_price_val
         reward = tp_target - entry_price
 
-    if risk <= 0:
+    if risk <= 0 or reward <= 0:
         return None
 
     rr = reward / risk
     if rr < MIN_RR_RATIO:
         return None
+    if rr > MAX_RR_RATIO:
+        return None  # Unrealistic R:R = bad SL placement
 
     return TradeSetup(
         signal=signal,
