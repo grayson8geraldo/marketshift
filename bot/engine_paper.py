@@ -266,13 +266,27 @@ class PaperTradingEngine:
             bid, ask = price_feeds[sym]
             current_price = (bid + ask) / 2
 
+            # Check if price is near any zone
             found_entry = False
+            nearest_zone_dist = None
             for zone in state.zones:
+                dist_to_zone = min(
+                    abs(current_price - zone.upper),
+                    abs(current_price - zone.lower),
+                )
+                if nearest_zone_dist is None or dist_to_zone < nearest_zone_dist:
+                    nearest_zone_dist = dist_to_zone
+
                 if not (zone.lower <= current_price <= zone.upper):
                     continue
 
+                print(f"  [{sym}] Price {current_price:.5f} IN "
+                      f"{zone.zone_type.value} zone "
+                      f"[{zone.lower:.5f}–{zone.upper:.5f}]")
+
                 tp_target = self._find_tp_target(state, zone)
                 if tp_target is None:
+                    print(f"    → No opposing zone for TP, skip")
                     continue
 
                 try:
@@ -282,6 +296,36 @@ class PaperTradingEngine:
 
                 setup = find_entry(df_ltf, zone, tp_target, state.point_size)
                 if setup is None:
+                    # Diagnostic: run entry steps manually to show reason
+                    from bot.entry import _detect_exhaustion, _ltf_swings, _detect_structure_break
+                    highs = df_ltf["high"].values
+                    lows = df_ltf["low"].values
+
+                    arrival_idx = None
+                    for i in range(len(df_ltf)):
+                        if zone.zone_type == ZoneType.SUPPLY and highs[i] >= zone.lower:
+                            arrival_idx = i
+                            break
+                        if zone.zone_type == ZoneType.DEMAND and lows[i] <= zone.upper:
+                            arrival_idx = i
+                            break
+
+                    if arrival_idx is None:
+                        print(f"    → Price never entered zone on LTF")
+                    else:
+                        exh = _detect_exhaustion(df_ltf, zone, arrival_idx)
+                        if not exh:
+                            print(f"    → No exhaustion move (approach too slow/choppy)")
+                        else:
+                            sh_idx, sh_price, sl_idx, sl_price = _ltf_swings(df_ltf)
+                            bos = _detect_structure_break(
+                                df_ltf, zone, sh_idx, sh_price,
+                                sl_idx, sl_price, arrival_idx
+                            )
+                            if bos is None:
+                                print(f"    → Exhaustion OK, but no BOS (structure not broken)")
+                            else:
+                                print(f"    → Exhaustion OK, BOS OK, but R:R or SL filter rejected")
                     continue
 
                 # Execute paper trade
