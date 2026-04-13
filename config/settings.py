@@ -26,12 +26,14 @@ ROUND_NUMBER_TOLERANCE = 0.001 # 0.1% tolerance for round-number detection
 
 # ─── Entry Logic (LTF) ────────────────────────────────────────────────
 FRACTAL_PERIOD = 5             # Swing high/low lookback on each side
-EXHAUSTION_CANDLE_COUNT = 5    # Number of recent candles to evaluate speed
-EXHAUSTION_BODY_RATIO = 0.7    # Min avg body/range ratio for exhaustion move
-EXHAUSTION_RETRACEMENT = 0.2   # Max allowed retracement during approach (20%)
+EXHAUSTION_CANDLE_COUNT = 8    # Number of recent candles to evaluate speed
+EXHAUSTION_BODY_RATIO = 0.45   # Min avg body/range ratio for exhaustion move
+EXHAUSTION_RETRACEMENT = 0.4   # Max allowed retracement during approach (40%)
 
 STRUCTURE_BREAK_CONFIRM = True # Require candle CLOSE beyond structure level
 MIN_RR_RATIO = 2.0             # Minimum reward-to-risk ratio to take a trade
+MAX_RR_RATIO = 10.0            # Maximum R:R — above this is likely a bad SL
+MIN_SL_PIPS = 10               # Minimum stop-loss distance in pips
 
 # ─── Risk Management ──────────────────────────────────────────────────
 RISK_PER_TRADE_PCT = 1.0       # Risk per trade as % of account balance
